@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         YouTube A/B Loop
-// @version      1.0.0
+// @version      2.0.0
 // @description  A/B loop — native YouTube player integration
 // @author       Black0S
 // @match        https://www.youtube.com/watch*
