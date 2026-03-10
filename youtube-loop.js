@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         YouTube A/B Loop
-// @version      3.0.0
+// @version      1.0.0
 // @description  A/B loop — native YouTube player integration
 // @author       Black0S
 // @match        https://www.youtube.com/watch*
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript-/refs/heads/main/youtube-loop.js
+// @downloadURL  https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript-/refs/heads/main/youtube-loop.js
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -221,6 +225,30 @@
       transition: border-color .15s, color .15s, background .15s;
     }
     .abl-reset-btn:hover { border-color: rgba(255,60,60,.5); color: #f66; background: rgba(255,0,0,.08); }
+
+    /* ── Update banner (shown when a newer version is available) ── */
+    .abl-update-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 7px 16px; gap: 10px;
+      background: rgba(255, 180, 0, .10);
+      border-top: 1px solid rgba(255, 180, 0, .18);
+      /* Hidden by default */
+      display: none;
+    }
+    .abl-update-bar.visible { display: flex; }
+    .abl-update-text {
+      font-size: 11px; color: rgba(255, 210, 80, .9); flex: 1;
+    }
+    .abl-update-text strong { color: #ffd050; }
+    .abl-update-link {
+      font-size: 11px; font-weight: 600; color: #ffd050;
+      text-decoration: none; white-space: nowrap;
+      padding: 3px 9px; border-radius: 5px;
+      border: 1px solid rgba(255, 208, 80, .35);
+      background: rgba(255, 208, 80, .08);
+      transition: background .15s, border-color .15s;
+    }
+    .abl-update-link:hover { background: rgba(255, 208, 80, .18); border-color: rgba(255, 208, 80, .6); }
   `;
 
 
@@ -315,6 +343,18 @@
         <div class="abl-hint"><span class="abl-kbd">B</span> Point B</div>
       </div>
       <button class="abl-reset-btn" id="abl-reset">Reset</button>
+    </div>
+
+    <!-- Update banner: hidden until checkForUpdate() finds a newer version -->
+    <div class="abl-update-bar" id="abl-update-bar">
+      <span class="abl-update-text">
+        Update available: <strong id="abl-update-version"></strong>
+      </span>
+      <a class="abl-update-link"
+         href="https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript-/refs/heads/main/youtube-loop.js"
+         target="_blank" rel="noopener">
+        Install
+      </a>
     </div>`;
 
 
@@ -683,7 +723,55 @@
       thB         : q('#abl-th-b'),
       thPlay      : q('#abl-th-play'),
       tEnd        : q('#abl-t-end'),
+      updateBar   : q('#abl-update-bar'),
+      updateVersion: q('#abl-update-version'),
     };
+  }
+
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  UPDATE CHECK
+  //  Fetches the raw script from GitHub, extracts the @version from the header,
+  //  and shows the update banner in the panel if a newer version is available.
+  //  Uses GM_xmlhttpRequest to bypass cross-origin restrictions.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const CURRENT_VERSION  = '1.0.0';
+  const RAW_SCRIPT_URL   = 'https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript-/refs/heads/main/youtube-loop.js';
+
+  /**
+   * Compares two semver strings (e.g. "1.0.0" vs "1.1.0").
+   * Returns true if `remote` is strictly newer than `local`.
+   */
+  function isNewer(local, remote) {
+    const toInt = (v) => v.split('.').map(Number);
+    const [la, lb, lc] = toInt(local);
+    const [ra, rb, rc] = toInt(remote);
+    return ra > la || (ra === la && rb > lb) || (ra === la && rb === lb && rc > lc);
+  }
+
+  /**
+   * Fetches the remote script, parses the @version line, and reveals the
+   * update banner inside the panel if a newer version is found.
+   * Called once per session, non-blocking.
+   */
+  function checkForUpdate(ui) {
+    GM_xmlhttpRequest({
+      method  : 'GET',
+      url     : RAW_SCRIPT_URL,
+      // Only download the first 512 bytes — the @version is always in the header
+      headers : { Range: 'bytes=0-511' },
+      onload  : (res) => {
+        const match = res.responseText.match(/@version\s+([\d.]+)/);
+        if (!match) return;
+        const remoteVersion = match[1];
+        if (isNewer(CURRENT_VERSION, remoteVersion)) {
+          ui.updateVersion.textContent = `v${remoteVersion}`;
+          ui.updateBar.classList.add('visible');
+        }
+      },
+      onerror : () => { /* silently ignore network errors */ },
+    });
   }
 
 
@@ -727,6 +815,7 @@
     setupTimeline(sess);
     setupKeyboard(sess);
     startRenderLoop(sess);
+    checkForUpdate(ui);
   }
 
 
