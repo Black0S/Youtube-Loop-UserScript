@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         YouTube A/B Loop
-// @version      2.0.0
+// @version      3.0.0
 // @description  A/B loop for YouTube — universal userscript manager support
 // @author       Black0S
 // @match        https://www.youtube.com/watch*
@@ -29,7 +29,7 @@
   //  1.  CONSTANTS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const VERSION        = '2.0.0';
+  const VERSION        = '3.0.0';
   const UPDATE_URL     = 'https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.js';
   const POLL_MS        = 700;   // player-ready retry interval
   const NAV_DELAY_MS   = 1600;  // wait after SPA navigation before re-injecting
@@ -92,9 +92,31 @@
     return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${pad(m)}:${pad(ss)}`;
   }
 
+  /**
+   * Parses a strict "m:ss" or "h:mm:ss" string → seconds.
+   * Returns null on any invalid format. Inverse of fmt().
+   *   "0:05"→5  "1:23"→83  "12:09"→729  "1:02:03"→3723
+   *   "83"·"1:2"·"1:60"·":30" → null
+   */
+  function parseTime(str) {
+    const m = String(str).trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    const hasH = m[1] != null;
+    const h  = hasH ? Number(m[1]) : 0;
+    const mm = Number(m[2]);
+    const ss = Number(m[3]);
+    if (ss >= 60) return null;
+    if (hasH && mm >= 60) return null; // minutes must be < 60 only when hours present
+    return h * 3600 + mm * 60 + ss;
+  }
+
   /** Returns true if semver string `b` is strictly newer than `a`. */
   function semverGt(a, b) {
-    const p = (v) => v.split('.').map(Number);
+    // Pad to 3 segments so "2.0" compares correctly against "2.0.0".
+    const p = (v) => {
+      const [x = 0, y = 0, z = 0] = String(v).split('.').map((n) => Number(n) || 0);
+      return [x, y, z];
+    };
     const [a0,a1,a2] = p(a), [b0,b1,b2] = p(b);
     return b0 > a0 || (b0===a0 && b1>a1) || (b0===a0 && b1===a1 && b2>a2);
   }
@@ -228,6 +250,14 @@
       color:rgba(255,255,255,.3); transition:color .2s;
     }
     .abl-card.set .abl-time { color:#fff; }
+    .abl-time .abl-time-input {
+      width:54px; box-sizing:border-box;
+      background:rgba(255,255,255,.12);
+      border:1px solid rgba(255,255,255,.3); border-radius:4px;
+      color:#fff; font-family:inherit; font-size:13px; font-weight:500;
+      font-variant-numeric:tabular-nums; padding:1px 4px;
+      outline:none; text-align:left;
+    }
     .abl-card-r { display:flex; gap:2px; }
     .abl-set {
       font-family:inherit; font-size:10px; font-weight:600;
@@ -323,14 +353,7 @@
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  5.  SVG ICON
-  // ═══════════════════════════════════════════════════════════════════════════
-
-
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  6.  TRUSTED-TYPES-SAFE DOM HELPERS
+  //  5.  TRUSTED-TYPES-SAFE DOM HELPERS
   //
   //  Helium enforces YouTube's Trusted Types CSP so aggressively that even
   //  DOMParser.parseFromString() is blocked ("This document requires
@@ -427,7 +450,7 @@
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  7.  PANEL HTML
+  //  6.  PANEL HTML
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -555,6 +578,10 @@
       ptA: null, ptB: null,
       loopOn: false, mode: 'ab',
       open: false, drag: null, raf: null,
+      // All document/window listeners register against this signal so a single
+      // controller.abort() in teardown() removes them — prevents leak across
+      // SPA navigations.
+      ac: new AbortController(),
       _pct: -1, _dur: -1, _lo: -1, _hi: -1,
     };
   }
@@ -564,8 +591,8 @@
   //  8.  POINT OPERATIONS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function setPoint(s, ab) {
-    const t = s.video.currentTime;
+  /** Set point A or B to an explicit time (seconds). Shared by Set/drag/edit. */
+  function applyPoint(s, ab, t) {
     if (ab === 'a') {
       s.ptA = t;
       s.r.valA.textContent = fmt(t);
@@ -578,6 +605,11 @@
       s.r.thB.classList.add('vis');
     }
     s._lo = s._hi = -1; // invalidate range cache
+  }
+
+  /** Set a point to the video's current playback position. */
+  function setPoint(s, ab) {
+    applyPoint(s, ab, s.video.currentTime);
   }
 
   function clrPoint(s, ab) {
@@ -604,42 +636,45 @@
     try {
       const { video: v, r } = s;
       const dur = v.duration || 0;
-
-      // Duration label — written once per video
-      if (dur !== s._dur) {
-        r.tEnd.textContent = fmt(dur);
-        s._dur = dur;
-      }
-
-      // Playhead position
-      const pct = dur ? (v.currentTime / dur) * 100 : 0;
-      if (pct !== s._pct) {
-        r.prog.style.width   = pct + '%';
-        r.thPlay.style.left  = pct + '%';
-        s._pct = pct;
-      }
-
-      // A / B thumb positions (only when the point is set and duration known)
-      if (s.ptA !== null && dur) r.thA.style.left = (s.ptA / dur * 100) + '%';
-      if (s.ptB !== null && dur) r.thB.style.left = (s.ptB / dur * 100) + '%';
-
-      // A→B highlight range (redrawn only when boundaries change)
       const both = s.ptA !== null && s.ptB !== null;
-      if (s.mode === 'ab' && both && dur) {
-        const lo = Math.min(s.ptA, s.ptB);
-        const hi = Math.max(s.ptA, s.ptB);
-        if (lo !== s._lo || hi !== s._hi) {
-          r.range.style.left  = (lo / dur * 100) + '%';
-          r.range.style.width = ((hi - lo) / dur * 100) + '%';
-          r.range.classList.add('on');
-          s._lo = lo; s._hi = hi;
+
+      // ── Timeline visuals — skipped while the panel is closed ───────────────
+      if (s.open) {
+        // Duration label — written once per video
+        if (dur !== s._dur) {
+          r.tEnd.textContent = fmt(dur);
+          s._dur = dur;
         }
-      } else if (r.range.classList.contains('on')) {
-        r.range.classList.remove('on');
-        s._lo = s._hi = -1;
+
+        // Playhead position
+        const pct = dur ? (v.currentTime / dur) * 100 : 0;
+        if (pct !== s._pct) {
+          r.prog.style.width   = pct + '%';
+          r.thPlay.style.left  = pct + '%';
+          s._pct = pct;
+        }
+
+        // A / B thumb positions (only when the point is set and duration known)
+        if (s.ptA !== null && dur) r.thA.style.left = (s.ptA / dur * 100) + '%';
+        if (s.ptB !== null && dur) r.thB.style.left = (s.ptB / dur * 100) + '%';
+
+        // A→B highlight range (redrawn only when boundaries change)
+        if (s.mode === 'ab' && both && dur) {
+          const lo = Math.min(s.ptA, s.ptB);
+          const hi = Math.max(s.ptA, s.ptB);
+          if (lo !== s._lo || hi !== s._hi) {
+            r.range.style.left  = (lo / dur * 100) + '%';
+            r.range.style.width = ((hi - lo) / dur * 100) + '%';
+            r.range.classList.add('on');
+            s._lo = lo; s._hi = hi;
+          }
+        } else if (r.range.classList.contains('on')) {
+          r.range.classList.remove('on');
+          s._lo = s._hi = -1;
+        }
       }
 
-      // ── Loop enforcement ──────────────────────────────────────────────────
+      // ── Loop enforcement — always runs, panel open or not ──────────────────
       if (s.loopOn) {
         if (s.mode === 'ab' && both) {
           const lo = Math.min(s.ptA, s.ptB);
@@ -670,6 +705,9 @@
       s.open = !s.open;
       s.panel.classList.toggle('open', s.open);
       s.btn.classList.toggle('active', s.open || s.loopOn);
+      // Force the next frame to redraw the timeline (visuals are skipped while
+      // the panel is closed, so caches may be stale on reopen).
+      if (s.open) s._pct = s._dur = s._lo = s._hi = -1;
     });
     // Close on outside click
     document.addEventListener('click', (e) => {
@@ -678,7 +716,7 @@
         s.panel.classList.remove('open');
         s.btn.classList.toggle('active', s.loopOn);
       }
-    });
+    }, { signal: s.ac.signal });
   }
 
   function wireToggle(s) {
@@ -712,7 +750,6 @@
     s.r.setB.addEventListener('click', () => setPoint(s, 'b'));
     s.r.clrA.addEventListener('click', () => clrPoint(s, 'a'));
     s.r.clrB.addEventListener('click', () => clrPoint(s, 'b'));
-    s.r[/* reset btn */ 'resetBtn'] = s.panel.querySelector('.abl-reset');
     s.r.resetBtn.addEventListener('click', () => {
       clrPoint(s, 'a'); clrPoint(s, 'b');
       s.loopOn = false;
@@ -738,28 +775,82 @@
       });
     }
 
-    draggable(r.thA, (x) => {
-      s.ptA = frac(x) * (v.duration || 0);
-      r.valA.textContent = fmt(s.ptA);
-      r.cardA.classList.add('set'); r.thA.classList.add('vis');
-      s._lo = s._hi = -1;
-    });
-    draggable(r.thB, (x) => {
-      s.ptB = frac(x) * (v.duration || 0);
-      r.valB.textContent = fmt(s.ptB);
-      r.cardB.classList.add('set'); r.thB.classList.add('vis');
-      s._lo = s._hi = -1;
-    });
+    draggable(r.thA, (x) => applyPoint(s, 'a', frac(x) * (v.duration || 0)));
+    draggable(r.thB, (x) => applyPoint(s, 'b', frac(x) * (v.duration || 0)));
     draggable(r.thPlay, (x) => {
       if (v.duration) v.currentTime = frac(x) * v.duration;
     });
 
-    document.addEventListener('mousemove', (e) => { if (s.drag) s.drag(e.clientX); });
-    document.addEventListener('mouseup',   ()  => { s.drag = null; });
+    document.addEventListener('mousemove', (e) => { if (s.drag) s.drag(e.clientX); }, { signal: s.ac.signal });
+    document.addEventListener('mouseup',   ()  => { s.drag = null; }, { signal: s.ac.signal });
 
     r.rail.addEventListener('click', (e) => {
       if (!s.drag && v.duration) v.currentTime = frac(e.clientX) * v.duration;
     });
+  }
+
+  /**
+   * Click a point's time label → edit it in place as "m:ss" / "h:mm:ss".
+   * Enter / blur commits (clamped to [0, duration]); Escape or invalid reverts.
+   * Empty input commits as a cleared point.
+   */
+  function wireTimeEdit(s) {
+    const { r } = s;
+
+    function spanOf(ab)  { return ab === 'a' ? r.valA : r.valB; }
+    function timeOf(ab)  { return ab === 'a' ? s.ptA  : s.ptB; }
+
+    function revert(ab) {
+      const cur = timeOf(ab);
+      spanOf(ab).textContent = cur !== null ? fmt(cur) : EMPTY;
+    }
+
+    function edit(ab) {
+      const span = spanOf(ab);
+      if (span.querySelector('input')) return; // already editing
+      const cur = timeOf(ab);
+
+      const input = el('input', 'abl-time-input');
+      input.type        = 'text';
+      input.value       = cur !== null ? fmt(cur) : '';
+      input.placeholder = 'm:ss';
+      span.textContent  = '';
+      span.appendChild(input);
+      input.focus();
+      input.select();
+
+      let done = false;
+      function finish(commit) {
+        if (done) return;
+        done = true;
+        if (commit) {
+          const raw = input.value.trim();
+          if (raw === '') { clrPoint(s, ab); return; }
+          const secs = parseTime(raw);
+          if (secs !== null) {
+            const dur = s.video.duration || 0;
+            const t = dur ? Math.min(secs, dur) : secs;
+            applyPoint(s, ab, Math.max(0, t));
+            return;
+          }
+          // invalid format → fall through to revert
+        }
+        revert(ab);
+      }
+
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation(); // don't trigger A/B shortcuts or YouTube hotkeys
+        if (e.key === 'Enter')       { e.preventDefault(); finish(true); }
+        else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+      });
+      input.addEventListener('blur',  () => finish(true));
+      input.addEventListener('click', (e) => e.stopPropagation());
+    }
+
+    r.valA.style.cursor = 'pointer';
+    r.valB.style.cursor = 'pointer';
+    r.valA.addEventListener('click', () => edit('a'));
+    r.valB.addEventListener('click', () => edit('b'));
   }
 
   function wireKeyboard(s) {
@@ -768,7 +859,7 @@
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
       if (e.key === 'a' || e.key === 'A') setPoint(s, 'a');
       if (e.key === 'b' || e.key === 'B') setPoint(s, 'b');
-    });
+    }, { signal: s.ac.signal });
   }
 
   function wireUpdate(r) {
@@ -861,6 +952,7 @@
     wireToggle(s);
     wirePoints(s, setMode);
     wireTimeline(s);
+    wireTimeEdit(s);
     wireKeyboard(s);
     requestAnimationFrame(() => frame(s));
     wireUpdate(r);
@@ -874,6 +966,7 @@
   function teardown() {
     if (!session) return;
     try { cancelAnimationFrame(session.raf); } catch { /* ignore */ }
+    try { session.ac.abort(); }               catch { /* ignore */ }
     try { session.btn.remove(); }             catch { /* ignore */ }
     try { session.panel.remove(); }           catch { /* ignore */ }
     session = null;
