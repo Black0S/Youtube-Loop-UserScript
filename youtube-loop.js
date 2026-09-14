@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         YouTube A/B Loop
-// @version      3.0.0
+// @version      3.0.1
 // @description  A/B loop for YouTube — universal userscript manager support
 // @author       Black0S
 // @match        https://www.youtube.com/watch*
@@ -632,6 +632,43 @@
   //  9.  RENDER LOOP  (RAF — runs once per animation frame)
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /**
+   * Keep the video inside the loop. Called every animation frame while the tab is
+   * visible, and on the video's own `timeupdate` / `ended` events.
+   *
+   * Why both: browsers stop `requestAnimationFrame` on a page nobody sees — another
+   * tab, a minimized or fully covered window. The video keeps playing, but a RAF-only
+   * loop never runs, so it plays past B (or to the end, where YouTube moves on).
+   * `timeupdate` keeps firing while the media plays, visible or not.
+   *
+   * `margin` is how early "the end" counts in full mode: a frame comes every ~16 ms,
+   * `timeupdate` only every ~250 ms, so the event path needs a wider window.
+   */
+  function enforceLoop(s, margin) {
+    if (!s.loopOn) return;
+    const v = s.video;
+    const dur = v.duration || 0;
+    if (s.mode === 'ab' && s.ptA !== null && s.ptB !== null) {
+      const lo = Math.min(s.ptA, s.ptB);
+      const hi = Math.max(s.ptA, s.ptB);
+      if (v.currentTime >= hi || v.currentTime < lo) v.currentTime = lo;
+    } else if (s.mode === 'full' && dur > 0) {
+      // YouTube suppresses the `ended` event after the first replay.
+      // Poll currentTime directly instead — reliable on every loop.
+      if (v.ended || v.currentTime >= dur - margin) {
+        v.currentTime = 0;
+        v.play().catch(() => {});
+      }
+    }
+  }
+
+  /** The loop keeps working when the tab is hidden — see `enforceLoop`. */
+  function wireBackgroundLoop(s) {
+    const opts = { signal: s.ac.signal };
+    s.video.addEventListener('timeupdate', () => { try { enforceLoop(s, 0.6); } catch { /* ignore */ } }, opts);
+    s.video.addEventListener('ended', () => { try { enforceLoop(s, 0.6); } catch { /* ignore */ } }, opts);
+  }
+
   function frame(s) {
     try {
       const { video: v, r } = s;
@@ -675,20 +712,7 @@
       }
 
       // ── Loop enforcement — always runs, panel open or not ──────────────────
-      if (s.loopOn) {
-        if (s.mode === 'ab' && both) {
-          const lo = Math.min(s.ptA, s.ptB);
-          const hi = Math.max(s.ptA, s.ptB);
-          if (v.currentTime >= hi || v.currentTime < lo) v.currentTime = lo;
-        } else if (s.mode === 'full' && dur > 0) {
-          // YouTube suppresses the `ended` event after the first replay.
-          // Poll currentTime directly instead — reliable on every loop.
-          if (v.ended || v.currentTime >= dur - 0.3) {
-            v.currentTime = 0;
-            v.play().catch(() => {});
-          }
-        }
-      }
+      enforceLoop(s, 0.3);
     } catch { /* keep RAF alive even on transient errors */ }
 
     s.raf = requestAnimationFrame(() => frame(s));
@@ -954,6 +978,7 @@
     wireTimeline(s);
     wireTimeEdit(s);
     wireKeyboard(s);
+    wireBackgroundLoop(s);
     requestAnimationFrame(() => frame(s));
     wireUpdate(r);
   }
