@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         YouTube A/B Loop
-// @version      3.0.1
+// @version      3.1.0
 // @description  A/B loop for YouTube — universal userscript manager support
 // @author       Black0S
-// @match        https://www.youtube.com/watch*
+// @match        https://www.youtube.com/*
+// @match        https://m.youtube.com/*
 // @noframes
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.js
-// @downloadURL  https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.js
+// @updateURL    https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.user.js
+// @downloadURL  https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      raw.githubusercontent.com
@@ -29,8 +30,17 @@
   //  1.  CONSTANTS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const VERSION        = '3.0.0';
-  const UPDATE_URL     = 'https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.js';
+  // Read the version from the manager (single source of truth = @version);
+  // the literal is only a fallback and must be kept equal to @version.
+  const VERSION = (() => {
+    try { if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) return GM_info.script.version; } catch { /* ignore */ }
+    try { if (typeof GM !== 'undefined' && GM.info && GM.info.script && GM.info.script.version) return GM.info.script.version; } catch { /* ignore */ }
+    return '3.1.0';
+  })();
+  // ".user.js" suffix → Tampermonkey / Violentmonkey / Userscripts (Safari)
+  // offer to install when the link is opened.
+  const UPDATE_URL     = 'https://raw.githubusercontent.com/Black0S/Youtube-Loop-UserScript/refs/heads/main/youtube-loop.user.js';
+  const IS_MOBILE_SITE = location.hostname === 'm.youtube.com';
   const POLL_MS        = 700;   // player-ready retry interval
   const NAV_DELAY_MS   = 1600;  // wait after SPA navigation before re-injecting
   const URL_CHECK_MS   = 600;   // URL-polling interval for SPA detection
@@ -71,8 +81,11 @@
     }
 
     // — Universal fallback (GitHub raw sends Access-Control-Allow-Origin: *) —
+    // No Range header here: it is not CORS-safelisted in every engine
+    // (older Safari / Firefox send a preflight that raw.githubusercontent
+    // does not answer), so the request would fail silently.
     try {
-      fetch(url, { headers: { Range: 'bytes=0-511' }, cache: 'no-store' })
+      fetch(url, { cache: 'no-store', credentials: 'omit' })
         .then((r) => r.text()).then(onText).catch(() => {});
     } catch { /* ignore */ }
   }
@@ -157,7 +170,7 @@
       opacity:0; transform:translateY(8px) scale(.97);
       transform-origin:bottom right;
       transition:opacity .18s, transform .18s cubic-bezier(.4,0,.2,1);
-      pointer-events:none; user-select:none;
+      pointer-events:none; -webkit-user-select:none; user-select:none;
     }
     .abl-panel.open { opacity:1; transform:none; pointer-events:all; }
 
@@ -276,6 +289,7 @@
     .abl-track {
       position:relative; height:20px;
       display:flex; align-items:center; cursor:pointer; margin-bottom:3px;
+      touch-action:none; /* iPad Safari: drag ≠ page scroll */
     }
     .abl-rail {
       position:absolute; left:0; right:0; height:3px;
@@ -295,7 +309,7 @@
     .abl-th {
       position:absolute; top:50%; transform:translate(-50%,-50%);
       border-radius:50%; cursor:grab; z-index:2;
-      display:none; transition:transform .1s;
+      display:none; transition:transform .1s; touch-action:none;
     }
     .abl-th.vis   { display:block; }
     .abl-th:hover { transform:translate(-50%,-50%) scale(1.3); }
@@ -349,6 +363,26 @@
       transition:background .15s, border-color .15s;
     }
     .abl-update-lnk:hover { background:rgba(255,208,80,.18); border-color:rgba(255,208,80,.6); }
+
+    /* ── m.youtube.com: floating button + panel fixed to the viewport ── */
+    .abl-btn.abl-float {
+      position:absolute; top:8px; left:8px; z-index:99998;
+      width:40px; height:40px; border-radius:50%;
+      background:rgba(0,0,0,.55);
+    }
+    .abl-btn.abl-float .abl-dot { top:6px; right:6px; }
+    .abl-panel.abl-fixed {
+      position:fixed; left:8px; right:8px; width:auto; max-width:420px;
+      margin:0 auto;
+      bottom:calc(8px + env(safe-area-inset-bottom, 0px));
+      transform-origin:bottom center;
+    }
+
+    /* ── touch screens: bigger handles ── */
+    @media (pointer:coarse) {
+      .abl-th-ab, .abl-th-play { width:18px; height:18px; }
+      .abl-track { height:28px; }
+    }
   `;
 
 
@@ -578,12 +612,19 @@
       ptA: null, ptB: null,
       loopOn: false, mode: 'ab',
       open: false, drag: null, raf: null,
-      // All document/window listeners register against this signal so a single
-      // controller.abort() in teardown() removes them — prevents leak across
-      // SPA navigations.
-      ac: new AbortController(),
+      // Removers for every document/window/video listener (see listen()).
+      // teardown() runs them all — prevents leaks across SPA navigations.
+      // Replaces AbortController `signal`, which Safari < 15 / Firefox < 86
+      // silently ignore (listeners would pile up on each navigation).
+      offs: [],
       _pct: -1, _dur: -1, _lo: -1, _hi: -1,
     };
+  }
+
+  /** addEventListener + remember how to remove it (all engines). */
+  function listen(s, target, type, fn, opts) {
+    target.addEventListener(type, fn, opts);
+    s.offs.push(() => target.removeEventListener(type, fn, opts));
   }
 
 
@@ -664,9 +705,9 @@
 
   /** The loop keeps working when the tab is hidden — see `enforceLoop`. */
   function wireBackgroundLoop(s) {
-    const opts = { signal: s.ac.signal };
-    s.video.addEventListener('timeupdate', () => { try { enforceLoop(s, 0.6); } catch { /* ignore */ } }, opts);
-    s.video.addEventListener('ended', () => { try { enforceLoop(s, 0.6); } catch { /* ignore */ } }, opts);
+    const onTick = () => { try { enforceLoop(s, 0.6); } catch { /* ignore */ } };
+    listen(s, s.video, 'timeupdate', onTick);
+    listen(s, s.video, 'ended', onTick);
   }
 
   function frame(s) {
@@ -734,13 +775,13 @@
       if (s.open) s._pct = s._dur = s._lo = s._hi = -1;
     });
     // Close on outside click
-    document.addEventListener('click', (e) => {
+    listen(s, document, 'click', (e) => {
       if (s.open && !s.panel.contains(e.target) && e.target !== s.btn) {
         s.open = false;
         s.panel.classList.remove('open');
         s.btn.classList.toggle('active', s.loopOn);
       }
-    }, { signal: s.ac.signal });
+    });
   }
 
   function wireToggle(s) {
@@ -792,8 +833,16 @@
       return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     }
 
+    // Pointer Events cover mouse + touch + pen (Chrome, Firefox, Safari 13+,
+    // incl. iPad). Mouse-only fallback for engines without PointerEvent.
+    const HAS_PTR = typeof window.PointerEvent === 'function';
+    const EV_DOWN = HAS_PTR ? 'pointerdown' : 'mousedown';
+    const EV_MOVE = HAS_PTR ? 'pointermove' : 'mousemove';
+    const EV_UP   = HAS_PTR ? 'pointerup'   : 'mouseup';
+
     function draggable(el, cb) {
-      el.addEventListener('mousedown', (e) => {
+      el.addEventListener(EV_DOWN, (e) => {
+        if (e.button != null && e.button !== 0) return; // primary button / touch only
         e.preventDefault(); e.stopPropagation();
         s.drag = cb;
       });
@@ -805,8 +854,9 @@
       if (v.duration) v.currentTime = frac(x) * v.duration;
     });
 
-    document.addEventListener('mousemove', (e) => { if (s.drag) s.drag(e.clientX); }, { signal: s.ac.signal });
-    document.addEventListener('mouseup',   ()  => { s.drag = null; }, { signal: s.ac.signal });
+    listen(s, document, EV_MOVE, (e) => { if (s.drag) s.drag(e.clientX); });
+    listen(s, document, EV_UP,   ()  => { s.drag = null; });
+    if (HAS_PTR) listen(s, document, 'pointercancel', () => { s.drag = null; });
 
     r.rail.addEventListener('click', (e) => {
       if (!s.drag && v.duration) v.currentTime = frac(e.clientX) * v.duration;
@@ -878,12 +928,18 @@
   }
 
   function wireKeyboard(s) {
-    document.addEventListener('keydown', (e) => {
-      const t = e.target;
+    listen(s, document, 'keydown', (e) => {
+      // Cmd+A (macOS/Safari) / Ctrl+A / Alt combos must not set a point.
+      if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
+      // YouTube fields live in shadow DOM: e.target is retargeted to the host,
+      // so look at the real origin of the event (composedPath).
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+      const t = path[0] || e.target;
+      if (!t || !t.tagName) return;
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
       if (e.key === 'a' || e.key === 'A') setPoint(s, 'a');
       if (e.key === 'b' || e.key === 'B') setPoint(s, 'b');
-    }, { signal: s.ac.signal });
+    });
   }
 
   function wireUpdate(r) {
@@ -907,25 +963,45 @@
   //  Does NOT require #movie_player — selector may differ in some layouts.
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /** Only watch pages get the loop (the script now runs on all of YouTube). */
+  function isWatch() {
+    return location.pathname.startsWith('/watch');
+  }
+
   function playerReady() {
     try {
-      return !!(
-        document.querySelector('.ytp-right-controls') &&
-        document.querySelector('video')
-      );
+      return isWatch() && !!getPlayerEls();
     } catch {
       return false;
     }
   }
 
-  /** Resolve controls, player container and video element robustly. */
+  /**
+   * Resolve controls, player container and video element robustly.
+   * - www.youtube.com: needs the toolbar (.ytp-right-controls).
+   * - m.youtube.com : no toolbar → controls = null, button floats on the player.
+   */
   function getPlayerEls() {
-    const controls = document.querySelector('.ytp-right-controls');
+    if (IS_MOBILE_SITE) {
+      const player =
+        document.querySelector('#movie_player') ||
+        document.querySelector('.html5-video-player') ||
+        document.querySelector('#player-container-id');
+      const video = (player && player.querySelector('video')) || document.querySelector('video');
+      if (!video) return null;
+      return { controls: null, player: player || video.parentElement, video };
+    }
+
+    const controls = document.querySelector('#movie_player .ytp-right-controls') ||
+                     document.querySelector('.ytp-right-controls');
     const player   =
       document.querySelector('#movie_player') ||
       (controls && controls.closest('.html5-video-player')) ||
       (controls && controls.parentElement);
-    const video    = document.querySelector('video');
+    // Prefer the main player's <video> over hover-preview / miniplayer videos.
+    const video    =
+      (player && (player.querySelector('video.html5-main-video') || player.querySelector('video'))) ||
+      document.querySelector('video');
     if (!controls || !player || !video) return null;
     return { controls, player, video };
   }
@@ -939,7 +1015,7 @@
   let session = null;
 
   function inject() {
-    if (session) return;
+    if (session || !isWatch()) return;
     const els = getPlayerEls();
     if (!els) return;
     const { controls, player, video } = els;
@@ -963,11 +1039,26 @@
     const { panel, refs: r } = buildPanel();
 
     // Mount
-    try { controls.insertBefore(btn, controls.firstChild); }
-    catch { controls.appendChild(btn); }
-
-    player.style.position = 'relative';
-    player.appendChild(panel);
+    if (controls) {
+      // Desktop: button in the player toolbar, panel inside the player
+      try { controls.insertBefore(btn, controls.firstChild); }
+      catch { controls.appendChild(btn); }
+      player.style.position = 'relative';
+      player.appendChild(panel);
+    } else {
+      // m.youtube.com: floating button on the player; panel fixed to the
+      // viewport (the portrait player is too short to contain it).
+      btn.classList.remove('ytp-button');
+      btn.classList.add('abl-float');
+      // Keep taps on the button from toggling the mobile player's overlay
+      for (const t of ['pointerdown', 'touchstart', 'mousedown']) {
+        btn.addEventListener(t, (e) => e.stopPropagation(), { passive: true });
+      }
+      if (getComputedStyle(player).position === 'static') player.style.position = 'relative';
+      player.appendChild(btn);
+      panel.classList.add('abl-fixed');
+      document.body.appendChild(panel);
+    }
     const s = mkSession(video, btn, panel, r);
     session = s;
 
@@ -991,7 +1082,7 @@
   function teardown() {
     if (!session) return;
     try { cancelAnimationFrame(session.raf); } catch { /* ignore */ }
-    try { session.ac.abort(); }               catch { /* ignore */ }
+    for (const off of session.offs) { try { off(); } catch { /* ignore */ } }
     try { session.btn.remove(); }             catch { /* ignore */ }
     try { session.panel.remove(); }           catch { /* ignore */ }
     session = null;
@@ -1059,7 +1150,7 @@
     _navTimer = setTimeout(() => {
       _navTimer = null;
       teardown();
-      if (location.pathname.startsWith('/watch')) {
+      if (isWatch()) {
         setTimeout(() => { watchForControls(); tryInject(); }, NAV_DELAY_MS);
       }
     }, 50);
@@ -1095,8 +1186,12 @@
   //  16.  BOOT
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Start DOM watcher first (catches controls appearing), then poll as fallback
-  watchForControls();
-  tryInject();
+  // The script now loads on every YouTube page (so it's present when you
+  // reach a video from the home page). Only start watching on a watch page;
+  // otherwise the navigation layers above take over when one is opened.
+  if (isWatch()) {
+    watchForControls();
+    tryInject();
+  }
 
 })();
